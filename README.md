@@ -1,0 +1,2 @@
+# ClockfieldQuantumInformationTheory
+Sheesh. 
