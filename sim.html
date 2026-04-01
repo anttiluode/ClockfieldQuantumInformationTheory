@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clockfield Membrane Simulator</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #111;
+            color: #eee;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            height: 100vh;
+            overflow: hidden;
+        }
+        #sidebar {
+            width: 300px;
+            background: #222;
+            padding: 20px;
+            box-sizing: border-box;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+            border-right: 1px solid #444;
+            z-index: 10;
+        }
+        #canvas-container {
+            flex-grow: 1;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+        canvas {
+            image-rendering: pixelated;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            cursor: crosshair;
+        }
+        h2 { margin-top: 0; font-size: 1.2rem; border-bottom: 1px solid #444; padding-bottom: 10px; }
+        .control-group { display: flex; flex-direction: column; gap: 5px; }
+        .control-group label { font-size: 0.85rem; display: flex; justify-content: space-between; color: #aaa;}
+        input[type=range] { width: 100%; }
+        button {
+            background: #4CAF50; color: white; border: none; padding: 10px; 
+            border-radius: 4px; cursor: pointer; font-weight: bold; transition: background 0.2s;
+        }
+        button:hover { background: #45a049; }
+        button.secondary { background: #555; }
+        button.secondary:hover { background: #666; }
+        .instructions { font-size: 0.8rem; color: #888; margin-top: auto; line-height: 1.4; }
+        .highlight { color: #fff; }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <h2>Clockfield Controls</h2>
+        
+        <div class="control-group">
+            <label><span>Tau (τ) - Gravity/Freeze</span> <span id="val-tau">1.0</span></label>
+            <input type="range" id="tau" min="0" max="5" step="0.1" value="1.0">
+        </div>
+        
+        <div class="control-group">
+            <label><span>Mu² (μ²) - Mass</span> <span id="val-mu2">1.0</span></label>
+            <input type="range" id="mu2" min="0" max="2" step="0.1" value="1.0">
+        </div>
+        
+        <div class="control-group">
+            <label><span>Lambda (λ) - Self-interact</span> <span id="val-lambda">1.0</span></label>
+            <input type="range" id="lambda" min="0" max="2" step="0.1" value="1.0">
+        </div>
+
+        <div class="control-group">
+            <label><span>Damping (γ)</span> <span id="val-damping">0.01</span></label>
+            <input type="range" id="damping" min="0" max="0.1" step="0.001" value="0.01">
+        </div>
+
+        <button id="btn-vortex">Spawn Topological Vortex</button>
+        <button id="btn-vacuum" class="secondary">Reset to Vacuum</button>
+
+        <div class="instructions">
+            <p><strong class="highlight">Mouse Drag:</strong> Inject probe wave (Energy)</p>
+            <p><strong class="highlight">Shift + Drag:</strong> Destructive interference (Thaw / Melt)</p>
+            <p><strong>Colors:</strong> Hue represents phase angle (θ).</p>
+            <p><strong>Brightness:</strong> Represents local time metric (Γ). Dark areas are frozen particles (Γ→0). Bright areas are thawed waves (Γ→1).</p>
+        </div>
+    </div>
+
+    <div id="canvas-container">
+        <canvas id="simCanvas"></canvas>
+    </div>
+
+<script>
+    // --- Physics Parameters & State ---
+    const N = 150; // Grid size (150x150)
+    const dt = 0.15; // Time step
+    const stepsPerFrame = 4; // Simulation steps per visual frame
+
+    let params = {
+        tau: 1.0,
+        mu2: 1.0,
+        lambda: 1.0,
+        damping: 0.01
+    };
+
+    // Complex Field Arrays: u (real), v (imaginary)
+    // We need current, previous, and next states for Verlet integration
+    const size = N * N;
+    let u = new Float32Array(size);
+    let v = new Float32Array(size);
+    let u_prev = new Float32Array(size);
+    let v_prev = new Float32Array(size);
+    let u_next = new Float32Array(size);
+    let v_next = new Float32Array(size);
+
+    // --- UI Setup ---
+    const canvas = document.getElementById('simCanvas');
+    const ctx = canvas.getContext('2d', { alpha: false });
+    // Scale canvas visually but keep internal resolution N x N
+    const visualSize = 600; 
+    canvas.width = N;
+    canvas.height = N;
+    canvas.style.width = `${visualSize}px`;
+    canvas.style.height = `${visualSize}px`;
+
+    const imgData = ctx.createImageData(N, N);
+
+    // Bind UI controls
+    const bindSlider = (id) => {
+        const el = document.getElementById(id);
+        const valEl = document.getElementById(`val-${id}`);
+        el.addEventListener('input', (e) => {
+            params[id] = parseFloat(e.target.value);
+            valEl.textContent = params[id].toFixed(id === 'damping' ? 3 : 1);
+        });
+    };
+    ['tau', 'mu2', 'lambda', 'damping'].forEach(bindSlider);
+
+    // --- Initialization Functions ---
+    function resetVacuum() {
+        const eq_amp = params.lambda > 0 ? Math.sqrt(params.mu2 / params.lambda) : 0;
+        for (let i = 0; i < size; i++) {
+            // Fill with vacuum equilibrium amplitude plus tiny TADS noise
+            let phase = Math.random() * 2 * Math.PI;
+            let amp = eq_amp + (Math.random() - 0.5) * 0.1;
+            u[i] = amp * Math.cos(phase);
+            v[i] = amp * Math.sin(phase);
+            u_prev[i] = u[i];
+            v_prev[i] = v[i];
+        }
+    }
+
+    function spawnVortex() {
+        const eq_amp = params.lambda > 0 ? Math.sqrt(params.mu2 / params.lambda) : 1;
+        const cx = N / 2;
+        const cy = N / 2;
+        for (let y = 0; y < N; y++) {
+            for (let x = 0; x < N; x++) {
+                let dx = x - cx;
+                let dy = y - cy;
+                let r = Math.sqrt(dx*dx + dy*dy);
+                let phase = Math.atan2(dy, dx); // winding number = 1
+                
+                // Core amplitude goes to 0 at center (tanh envelope)
+                let amp = eq_amp * Math.tanh(r / 3.0); 
+                
+                let idx = y * N + x;
+                u[idx] = amp * Math.cos(phase);
+                v[idx] = amp * Math.sin(phase);
+                
+                // Give it a massive energy spike to trigger collapse
+                if(r < 5) {
+                    u[idx] *= 15;
+                    v[idx] *= 15;
+                }
+                
+                u_prev[idx] = u[idx];
+                v_prev[idx] = v[idx];
+            }
+        }
+    }
+
+    document.getElementById('btn-vacuum').addEventListener('click', resetVacuum);
+    document.getElementById('btn-vortex').addEventListener('click', spawnVortex);
+
+    // --- Physics Engine ---
+    function stepPhysics() {
+        const { tau, mu2, lambda, damping } = params;
+        const dt2 = dt * dt;
+
+        for (let y = 0; y < N; y++) {
+            // Precalculate Y indices for periodic wrap-around
+            const yUp = (y === 0 ? N - 1 : y - 1) * N;
+            const yDn = (y === N - 1 ? 0 : y + 1) * N;
+            const yC  = y * N;
+
+            for (let x = 0; x < N; x++) {
+                const i = yC + x;
+                const xL = x === 0 ? N - 1 : x - 1;
+                const xR = x === N - 1 ? 0 : x + 1;
+
+                // Neighbors
+                const left = yC + xL;
+                const right = yC + xR;
+                const up = yUp + x;
+                const down = yDn + x;
+
+                // Laplacian (5-point stencil)
+                const lapU = u[left] + u[right] + u[up] + u[down] - 4.0 * u[i];
+                const lapV = v[left] + v[right] + v[up] + v[down] - 4.0 * v[i];
+
+                // Energy Density (beta)
+                const beta = u[i]*u[i] + v[i]*v[i];
+                
+                // Clockfield Metric (Gamma) & Effective Speed
+                const tauBeta = tau * beta;
+                const ceff2 = 1.0 / (1.0 + tauBeta);
+                const gamma = 1.0 / Math.pow(1.0 + tauBeta, 2);
+                const gamma2 = gamma * gamma;
+
+                // PDE Force terms: c_eff^2 * Lap + mu^2 * phi - lambda * |phi|^2 * phi
+                const fu = ceff2 * lapU + mu2 * u[i] - lambda * beta * u[i];
+                const fv = ceff2 * lapV + mu2 * v[i] - lambda * beta * v[i];
+
+                // Verlet Integration with damping
+                let unew = 2.0 * u[i] - u_prev[i] + dt2 * gamma2 * fu - damping * (u[i] - u_prev[i]);
+                let vnew = 2.0 * v[i] - v_prev[i] + dt2 * gamma2 * fv - damping * (v[i] - v_prev[i]);
+
+                // Anti-explosion clamp
+                u_next[i] = Math.max(-100, Math.min(100, unew));
+                v_next[i] = Math.max(-100, Math.min(100, vnew));
+            }
+        }
+
+        // Swap buffers
+        for (let i = 0; i < size; i++) {
+            u_prev[i] = u[i];
+            v_prev[i] = v[i];
+            u[i] = u_next[i];
+            v[i] = v_next[i];
+        }
+    }
+
+    // --- Rendering ---
+    // Fast HSL to RGB helper
+    function hslToRgb(h, s, l) {
+        let c = (1 - Math.abs(2 * l - 1)) * s;
+        let x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+        let m = l - c / 2;
+        let r = 0, g = 0, b = 0;
+        if (0 <= h && h < 60) { r = c; g = x; b = 0; }
+        else if (60 <= h && h < 120) { r = x; g = c; b = 0; }
+        else if (120 <= h && h < 180) { r = 0; g = c; b = x; }
+        else if (180 <= h && h < 240) { r = 0; g = x; b = c; }
+        else if (240 <= h && h < 300) { r = x; g = 0; b = c; }
+        else if (300 <= h && h < 360) { r = c; g = 0; b = x; }
+        return [(r + m) * 255, (g + m) * 255, (b + m) * 255];
+    }
+
+    function render() {
+        const data = imgData.data;
+        const tau = params.tau;
+
+        for (let i = 0; i < size; i++) {
+            const uu = u[i];
+            const vv = v[i];
+            const beta = uu*uu + vv*vv;
+            
+            // Phase -> Hue (0 to 360)
+            let phase = Math.atan2(vv, uu);
+            if (phase < 0) phase += 2 * Math.PI;
+            const h = (phase * 180) / Math.PI;
+
+            // Metric -> Lightness
+            // Gamma = 1 -> L = 0.5 (bright colors). Gamma = 0 -> L = 0.0 (pitch black)
+            const gamma = 1.0 / Math.pow(1.0 + tau * beta, 2);
+            const l = gamma * 0.5; 
+            const s = 1.0; // Fully saturated
+
+            const [r, g, b] = hslToRgb(h, s, l);
+            
+            const px = i * 4;
+            data[px] = r;
+            data[px + 1] = g;
+            data[px + 2] = b;
+            data[px + 3] = 255;
+        }
+
+        ctx.putImageData(imgData, 0, 0);
+    }
+
+    function animate() {
+        for(let i=0; i<stepsPerFrame; i++){
+            stepPhysics();
+        }
+        render();
+        requestAnimationFrame(animate);
+    }
+
+    // --- Mouse Interaction ---
+    let isDragging = false;
+    let isShift = false;
+
+    canvas.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        isShift = e.shiftKey;
+        interact(e);
+    });
+    window.addEventListener('mouseup', () => isDragging = false);
+    canvas.addEventListener('mousemove', (e) => {
+        if (isDragging) {
+            isShift = e.shiftKey;
+            interact(e);
+        }
+    });
+
+    function interact(e) {
+        const rect = canvas.getBoundingClientRect();
+        // Calculate coordinate on the N x N grid
+        const cx = Math.floor((e.clientX - rect.left) / rect.width * N);
+        const cy = Math.floor((e.clientY - rect.top) / rect.height * N);
+        
+        const radius = 4;
+        for(let j = -radius; j <= radius; j++) {
+            for(let i = -radius; i <= radius; i++) {
+                if(i*i + j*j <= radius*radius) {
+                    // Periodic wrapping
+                    let x = (cx + i + N) % N;
+                    let y = (cy + j + N) % N;
+                    let idx = y * N + x;
+                    
+                    if(isShift) {
+                        // Thaw: Destructive interference (drive towards zero)
+                        u[idx] *= 0.5;
+                        v[idx] *= 0.5;
+                    } else {
+                        // Freeze: Inject massive probe wave energy
+                        let force = 2.0 * Math.exp(-(i*i + j*j)/3.0);
+                        u[idx] += force;
+                        v[idx] += force;
+                    }
+                }
+            }
+        }
+    }
+
+    // Start
+    resetVacuum();
+    animate();
+
+</script>
+</body>
+</html>
